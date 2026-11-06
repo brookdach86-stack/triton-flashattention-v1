@@ -1,31 +1,31 @@
-﻿# Triton FlashAttention v1 前向 + 反向
+﻿# Triton FlashAttention v1 Forward + Backward
 
-跟做 FlashAttention v1 的 forward + backward 完整链路。forward: online softmax → 无 mask → causal（加跳块）→ varlen。backward: 纯 Python 参考实现 → Triton step1（无 mask 多头）→ step2（causal）→ step3（varlen）。
+Full end-to-end implementation of FlashAttention v1 forward and backward passes in Triton. Forward progression: online softmax → no mask → causal (with block skipping) → varlen. Backward progression: pure Python reference → Triton step1 (no mask, multi-head) → step2 (causal) → step3 (varlen) → step4 (split-KV, no atomic_add) → step5 (full split-KV grid).
 
-FlashAttention 省显存的核心：`m` 变了之后 `o` 还在 SRAM 里，乘个 `alpha` 接着累加，不用把中间结果写回 HBM。forward 额外输出 `M/L`（每行 max 和 softmax 分母），backward 用它们重算 P 而不 materialize 完整 S 矩阵，保持 O(1) 显存。
+Core memory-saving idea: when `m` (row max) changes mid-accumulation, the running output `o` is still in SRAM — multiply by `alpha = exp(m_old - m_new)` and keep accumulating, no intermediate writeback to HBM. Forward additionally outputs `M/L` (per-row max and softmax denominator) so backward can recompute P without materializing the full S matrix, maintaining O(1) memory.
 
-## 环境
+## Environment
 
-RTX 5060 Laptop（384 GB/s 带宽，sm_120），Python 3.10，PyTorch + Triton。Windows 上 flash-attn 官方包装不了，SDPA flash 后端当 baseline。
+RTX 5060 Laptop (384 GB/s bandwidth, sm_120), Python 3.10, PyTorch + Triton. Official flash-attn CUDA wheel cannot be installed on Windows; PyTorch SDPA flash backend is used as baseline.
 
-## 文件
+## Files
 
-- `prerequisites/softmax_online.py`：online softmax 最小验证，一个 program 处理一行。对照 `torch.softmax`，阈值 `1e-5`。测了 128/512/1024/2048/8192 列，还有不规则长度 `[1000, 1001, 999, 998]`。
-- `v1_forward/step1_no_mask.py`：`[B, H, S, D_head]`，无 mask。当前默认 `B=1, H=8, D=128`（`D_head=16`），fp16。autotune 18 种配置（BLOCK_M 64/128, BLOCK_N 64/128, num_stages 2/3/4, num_warps 4/8）。benchmark 512/1024/2048/4096。
-- `v1_forward/step2_causal.py`：加 causal mask，同时做了跳块——for 循环上界从 `seqlen` 改成 `(block_m_idx+1)*BLOCK_M`，对角线 K block 内部保留 mask。autotune/benchmark 同 step1。
-- `v1_forward/step3_varlen.py`：序列不等长，`[B, H, max_seqlen, D_head]` padded 格式，`cu_seqlens` 标记有效长度。`pid(1)` 拆 `seq_idx * H + head_idx`，查 `cu_seqlens` 拿 per-sample seqlen。causal + 跳块 + autotune。forward 额外输出 `M/L`（`[B, H, max_seqlen]` float32）供 backward 使用。
-- `v1_backward/step1_backward.py`：Triton backward step1，无 mask，多头。5 步菜谱：① load Q/dO/O/M/L → ② `Di = sum(dO*O)` → ③ 循环 KV block：算 P → atomic_add dV → `ds = P*(dP-Di)` → `dQ += ds@K` → atomic_add dK。`dK/dV` 用 `tl.atomic_add` 跨 Q block 累积。
-- `v1_backward/step2_backward.py`：Triton backward step2，加 causal mask + 跳块。循环上界从 `seqlen` 改成 `(block_m_idx+1)*BLOCK_M`，score 上 `tl.where(k_pos > q_pos, -inf, s)`。
-- `v1_backward/step3_backward.py`：Triton backward step3，varlen padded。`seqlen = cu_seqlens[b+1]-cu_seqlens[b]`，load/store mask 用 per-sample seqlen，`if block_m_idx*BM >= seqlen: return` 跳过 padding 区 q block。
-- `v1_backward/step4_splitkv_backward.py`：Triton backward step4，partial + reduce 消除 atomic_add 冲突。dK/dV 不再 atomic_add 到全局，而是每个 Q block 写一份 partial，两个 reduce kernel 沿 Q 维加回来。dQ 在寄存器里直接累加存（因为同一 Q block 内部循环 KV 无冲突）。
-- `v1_backward/step4_varlen_causal.py`：step4 基础上合了 causal mask + varlen padded。`partial_dK/partial_dV` 用 `torch.empty`（所有位置都被写，不需要清零）。
-- `v1_backward/step5_splitkv_full.py`：step5，完整 split-KV grid `(num_q_blocks, num_kv_blocks, B*H)`。每个 program 只处理一个 (Q_block, KV_block) tile，dQ/dK/dV 全写 partial，三个 reduce kernel 分别沿 KV 维和 Q 维加。并行度最高但 Q 重复加载浪费。
-- `v1_backward/benchmark.py`：step4_varlen_causal 对纯 Python reference 的耗时对比，torch.profiler 看 kernel 时间占比。
-- `v1_forward/test_ref.py`：写 varlen 时手算对照用的，非正式。
-- `差距分析报告_v2.md`：第3-4周。对照 FA2 `flash_fwd_kernel`，把差距写到 `cp.async`、smem swizzle、warp 分工。
-- `test_v2_minimal.py`：三个 step 对 SDPA 的正确性和耗时，并打印差距归因。
+- `prerequisites/softmax_online.py`: Minimal online softmax verification, one program per row. Cross-checked against `torch.softmax` with threshold `1e-5`. Tested 128/512/1024/2048/8192 columns and irregular lengths `[1000, 1001, 999, 998]`.
+- `v1_forward/step1_no_mask.py`: `[B, H, S, D_head]`, no mask. Default `B=1, H=8, D=128` (`D_head=16`), fp16. Autotune over 18 configurations (BLOCK_M 64/128, BLOCK_N 64/128, num_stages 2/3/4, num_warps 4/8). Benchmarks at 512/1024/2048/4096.
+- `v1_forward/step2_causal.py`: Adds causal mask + block skipping — the KV loop upper bound changes from `seqlen` to `(block_m_idx+1)*BLOCK_M`, with mask preserved inside diagonal K blocks. Autotune/benchmark same as step1.
+- `v1_forward/step3_varlen.py`: Variable-length sequences, `[B, H, max_seqlen, D_head]` padded format, `cu_seqlens` marks valid lengths. `pid(1)` is split as `seq_idx * H + head_idx`, per-sample seqlen looked up from `cu_seqlens`. Causal + block skipping + autotune. Forward additionally outputs `M/L` (`[B, H, max_seqlen]` float32) for backward use.
+- `v1_backward/step1_backward.py`: Triton backward step1, no mask, multi-head. Five-step recipe: ① load Q/dO/O/M/L → ② `Di = sum(dO*O)` → ③ loop over KV blocks: compute P → atomic_add dV → `ds = P*(dP-Di)` → `dQ += ds@K` → atomic_add dK. `dK/dV` accumulated across Q blocks via `tl.atomic_add`.
+- `v1_backward/step2_backward.py`: Triton backward step2, adds causal mask + block skipping. Loop upper bound from `seqlen` to `(block_m_idx+1)*BLOCK_M`, score becomes `tl.where(k_pos > q_pos, -inf, s)`.
+- `v1_backward/step3_backward.py`: Triton backward step3, varlen padded. `seqlen = cu_seqlens[b+1]-cu_seqlens[b]`, load/store masks use per-sample seqlen, `if block_m_idx*BM >= seqlen: return` skips padding-region Q blocks.
+- `v1_backward/step4_splitkv_backward.py`: Triton backward step4, partial + reduce eliminates atomic_add contention. dK/dV no longer atomically accumulate to globals — each Q block writes a partial copy, two reduce kernels sum along the Q dimension. dQ accumulates directly in registers (no contention since KV-loop within one Q block is sequential).
+- `v1_backward/step4_varlen_causal.py`: step4 + causal mask + varlen padded. `partial_dK/partial_dV` use `torch.empty` (all positions written, no zeroing needed).
+- `v1_backward/step5_splitkv_full.py`: step5, full split-KV grid `(num_q_blocks, num_kv_blocks, B*H)`. Each program handles one (Q_block, KV_block) tile, dQ/dK/dV all write partials, three reduce kernels sum along KV and Q dimensions. Highest parallelism but duplicates Q loads.
+- `v1_backward/benchmark.py`: step4_varlen_causal vs pure Python reference latency, torch.profiler for kernel time breakdown.
+- `v1_forward/test_ref.py`: Manual reference for varlen testing, not part of the main pipeline.
+- `gap_analysis_v2.md`: Week 3-4 analysis — cross-checks against FA2 `flash_fwd_kernel`, gaps traced to `cp.async`, smem swizzle, and warp role partitioning.
+- `test_v2_minimal.py`: Correctness + latency of three steps vs SDPA, prints gap attribution.
 
-跑：
+Run:
 
 ```powershell
 python prerequisites/softmax_online.py
@@ -35,33 +35,33 @@ python v1_forward/step3_varlen.py
 python test_v2_minimal.py
 ```
 
-## 精度
+## Accuracy
 
 **Forward (fp32)**
 
-| | 形状 | 误差 |
+| | Shape | Error |
 | --- | --- | --- |
 | step1 | 64/128/256 | < 1e-4 |
 | step2 | 64/128/256 | < 3e-3 |
 | step3 | [64,32], [128,256], [64,128,192] | < 3e-3 |
 
-**Backward (fp32, 完整 forward→backward 链路)**
+**Backward (fp32, full forward→backward pipeline)**
 
-step1/step2: `B=2, H=8, D_head=16`，step3: padded varlen，对照纯 Python reference。
+step1/step2: `B=2, H=8, D_head=16`, step3: padded varlen, vs pure Python reference.
 
-| | 形状 | dQ | dK | dV |
+| | Shape | dQ | dK | dV |
 | --- | --- | --- | --- | --- |
 | step1 (no mask) | S=128/256/512 | < 4.3e-2 | < 3.4e-2 | < 4.6e-3 |
 | step2 (causal) | S=128/256/512 | < 4.6e-2 | < 3.7e-2 | < 1.6e-2 |
 | step3 (varlen) | [128,256], [64,128,192] | < 2.9e-2 | < 2.5e-2 | < 5.1e-3 |
 
-backward 误差略大于 forward（最大 ~4.6e-2），因为 `dK/dV` 用 `tl.atomic_add` 跨 Q block 累积，不同 block 的浮点加法顺序不一致带来额外误差，但在 fp32 下可控。
+Backward errors are slightly larger than forward (max ~4.6e-2) because `dK/dV` use `tl.atomic_add` across Q blocks — different accumulation orders across blocks introduce additional floating-point error, but this is controllable in fp32.
 
-step4/step5 没有 atomic_add，全部是顺序累加，误差更稳定。step4/varlen: `[128,256], [64,128,192]`，dQ/dK/dV 误差均 < 6.2e-2。
+step4/step5 have no atomic_add, all sequential accumulation, errors more stable. step4/varlen: `[128,256], [64,128,192]`, dQ/dK/dV all < 6.2e-2.
 
-## Backward 性能（step4_varlen_causal，fp32，D_head=64）
+## Backward Performance (step4_varlen_causal, fp32, D_head=64)
 
-对纯 Python reference 的加速，RTX 5060 Laptop：
+Speedup over pure Python reference, RTX 5060 Laptop:
 
 ```
 seqlens               Triton (ms)  Reference (ms)  Speedup
@@ -76,31 +76,31 @@ seqlens               Triton (ms)  Reference (ms)  Speedup
 [128, 256, 512]         0.50           1.27           2.56x
 ```
 
-## Backward 性能分析（torch.profiler，S=2048）
+## Backward Performance Analysis (torch.profiler, S=2048)
 
-kernel 时间占比：
+Kernel time breakdown:
 
 ```
-Kernel                          CUDA time   占比
+Kernel                          CUDA time   % of total
 ---------------------------------------------------
-_flash_attn_bwd_kernel          1.09ms      36%     核心计算
-_reduce_kernel × 2              1.08ms      36%     partial → dK/dV 归约
-vectorized_elementwise_kernel ×5 810us      27%     torch.zeros 清零开销
+_flash_attn_bwd_kernel          1.09ms      36%     core compute
+_reduce_kernel × 2              1.08ms      36%     partial → dK/dV reduction
+vectorized_elementwise_kernel ×5 810us      27%     torch.zeros zeroing overhead
 ---------------------------------------------------
-总计                            2.99ms
+Total                           2.99ms
 ```
 
-**关键发现**：
+**Key findings**:
 
-1. 核心 backward 计算只占 36%，partial+reduce 架构 overhead 达 63%（reduce 36% + 初始化 27%）
-2. `torch.zeros()` 改 `torch.empty()` 省掉 27% 初始化开销，S=2048 从 3.10ms 降到 2.34ms（24.5% 加速）
-3. reduce kernel 仍然是最大瓶颈（占 36%），atomic_add vs partial+reduce 的 trade-off 需要实测
+1. Core backward compute is only 36% of total — partial+reduce architecture overhead hits 63% (reduce 36% + initialization 27%)
+2. Replacing `torch.zeros()` with `torch.empty()` eliminates 27% initialization overhead — S=2048 drops from 3.10ms to 2.34ms (24.5% speedup)
+3. The reduce kernel remains the single largest bottleneck (36%) — the atomic_add vs partial+reduce tradeoff needs empirical measurement
 
-## 性能
+## Performance
 
-**step1 无 mask，fp16，B=1, H=8, D=128 (D_head=16)**
+**step1 no mask, fp16, B=1, H=8, D=128 (D_head=16)**
 
-BW% 按实际 HBM 字节计算：Q load 1 次，K/V 各被 S/BM 个 program 完整加载，O store 1 次。
+BW% computed from actual HBM bytes: Q loaded once, K/V fully loaded by `S/BM` programs each, O stored once.
 
 ```
    S |   Tri ms |  Tri TFLOPS |  Tri BW% |  SDPA ms | SDPA TFLOPS | Speedup
@@ -115,9 +115,9 @@ BW% 按实际 HBM 字节计算：Q load 1 次，K/V 各被 S/BM 个 program 完�
     ↳ best: BM=64 BN=64 ns=3 nw=4
 ```
 
-**step2 causal + 跳块，fp16，B=1, H=8, D=128 (D_head=16)**
+**step2 causal + block skipping, fp16, B=1, H=8, D=128 (D_head=16)**
 
-跳块后 K/V 加载量 ≈ S²/2 行（每个 program 只加载 (block_m_idx+1)*BM 行），约为 step1 的一半。
+With block skipping, K/V loading drops to ≈ S²/2 rows (each program only loads `(block_m_idx+1)*BM` rows), roughly half of step1.
 
 ```
    S |   Tri ms |  Tri TFLOPS |  Tri BW% |  SDPA ms | SDPA TFLOPS | Speedup
@@ -132,7 +132,7 @@ BW% 按实际 HBM 字节计算：Q load 1 次，K/V 各被 S/BM 个 program 完�
     ↳ best: BM=64 BN=64 ns=4 nw=4
 ```
 
-**step3 varlen + causal + 跳块，fp16**
+**step3 varlen + causal + block skipping, fp16**
 
 ```
 max_S |     seqlens      | Tri ms | Tri TFLOPS | Tri BW% | SDPA ms | Speedup
@@ -143,23 +143,23 @@ max_S |     seqlens      | Tri ms | Tri TFLOPS | Tri BW% | SDPA ms | Speedup
  1024 |  [1024,512,256]  |  0.160 |       1.10 |    2.2% |   0.520 |  3.26x
 ```
 
-## 一些观察
+## Observations
 
-**BW% 现在最高 40.6%，Triton 没跑满带宽**：之前用理论 AI=2×D_head 算出 BW% 超 100%，修正为实际 HBM 字节后正常。step2 跳块后 K/V 字节减半，BW% 更低（14~34%）——算子从带宽受限转向计算受限。大序列（S≥2048）的 Triton BW% 稳定在 34~41%，说明我们还有约 2.5x 的带宽可用空间。
+**Peak BW% is 40.6% — Triton is not saturating bandwidth**. Earlier estimates using theoretical arithmetic intensity `AI=2×D_head` gave BW% over 100%; corrected to actual HBM bytes they are reasonable. After block skipping in step2, K/V bytes halve and BW% drops further (14~34%) — the operator shifts from bandwidth-bound to compute-bound. For large sequences (S≥2048) Triton BW% stabilizes at 34~41%, leaving roughly 2.5× room on the memory side.
 
-**小序列差距来自 SDPA 后端效率**：step1 S=512 我们反而慢（0.52x），但 step2 同尺寸就反超了（1.20x）——因为 step2 有跳块优化，K/V loading 少了一半，HBM 总量从 2.4 MB 降到 1.4 MB，SDPA 在小矩阵上的 overhead 被摊薄了。
+**Small-sequence gaps come from SDPA backend efficiency**. step1 S=512 is actually slower (0.52x), but step2 at the same size overtakes (1.20x) — block skipping halves K/V loading, total HBM from 2.4 MB to 1.4 MB, and SDPA's fixed overhead dominates at small sizes.
 
-**autotune 不一定全选 64×64**：step2 S=2048 这次选了 BM=128 BN=128 ns=3 nw=8。跳块后循环次数（K block 数）减少，大 tile 减少 program launch 开销反而划算。但 S=4096 时又回到 BM=64——因为 K/V loading 量虽然跳块减半，但绝对数值还是大，小 tile 更好。
+**Autotune doesn't always pick 64×64**. step2 S=2048 selected BM=128 BN=128 ns=3 nw=8. After block skipping the loop iteration count (KV block count) drops, so larger tiles reduce launch overhead. But at S=4096 it goes back to BM=64 — absolute K/V loading is still large even after halving, so smaller tiles are better.
 
-**varlen 的优势**：padded SDPA 把所有句子 pad 到 max_seqlen，空转的 token 也得算。varlen 直接跳过，SDPA 慢 2.5~3.3x 就是这么来的。flops 统计按实际有效 token 算，不按 padded 算。
+**Varlen advantage**: padded SDPA pads all sequences to max_seqlen, wasting compute on padding tokens. Varlen skips them entirely — that's the 2.5~3.3x slowdown of SDPA. FLOPs counted on actual valid tokens, not padded length.
 
-**Windows 限制**：装不了官方 flash-attn CUDA 包，没法跟真正的手写 CUDA 比。SDPA 的 flash 后端在 Windows 上也没跑满性能，这大概是我们在大序列上能反超这么多的原因之一。
+**Windows limitation**: official flash-attn CUDA wheel won't install, so no comparison against handwritten CUDA kernels. SDPA's flash backend also doesn't run at full performance on Windows — this is likely part of why Triton can overtake so significantly at large sequences.
 
-## 还没做的
+## Not Yet Done
 
-- [x] 反向（step1/step2/step3/step4/step5，完整 Triton forward→backward 链路，对照纯 Python reference 误差 < 6e-2）
-- [x] FLOPs / 带宽按实际 HBM 字节重算（step1 K/V 被 S/BM 个 program 加载，step2 跳块后 ≈ S²/2 行）
-- [x] Backward 性能 benchmark + torch.profiler 分析（见上方）
-- [ ] Paged KV Cache（推理方向，另一个项目）
-- [ ] Forward+Backward 端到端 benchmark（当前只单独测了 backward）
-- [ ] Nsight Compute 深度分析（DRAM 带宽、SM occupancy、L2 hit rate）
+- [x] Backward (step1/step2/step3/step4/step5, complete Triton forward→backward pipeline, error vs pure Python reference < 6e-2)
+- [x] FLOPs / bandwidth recomputed from actual HBM bytes (step1 K/V loaded by S/BM programs, step2 after block skipping ≈ S²/2 rows)
+- [x] Backward benchmark + torch.profiler analysis (above)
+- [ ] Paged KV Cache (inference direction, separate project)
+- [ ] Forward+Backward end-to-end benchmark (currently backward measured independently)
+- [ ] Nsight Compute deep analysis (DRAM bandwidth, SM occupancy, L2 hit rate)
