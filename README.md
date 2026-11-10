@@ -21,9 +21,12 @@ RTX 5060 Laptop (384 GB/s bandwidth, sm_120), Python 3.10, PyTorch + Triton. Off
 - `v1_backward/step4_varlen_causal.py`: step4 + causal mask + varlen padded. `partial_dK/partial_dV` use `torch.empty` (all positions written, no zeroing needed).
 - `v1_backward/step5_splitkv_full.py`: step5, full split-KV grid `(num_q_blocks, num_kv_blocks, B*H)`. Each program handles one (Q_block, KV_block) tile, dQ/dK/dV all write partials, three reduce kernels sum along KV and Q dimensions. Highest parallelism but duplicates Q loads.
 - `v1_backward/benchmark.py`: step4_varlen_causal vs pure Python reference latency, torch.profiler for kernel time breakdown.
+- `v1_backward/benchmark_e2e.py`: Forward+backward end-to-end benchmark — measures fwd, bwd, and fwd→bwd as a single pipeline, reports TFLOPS for each phase and bwd% of total.
 - `v1_forward/test_ref.py`: Manual reference for varlen testing, not part of the main pipeline.
 - `gap_analysis_v2.md`: Week 3-4 analysis — cross-checks against FA2 `flash_fwd_kernel`, gaps traced to `cp.async`, smem swizzle, and warp role partitioning.
 - `test_v2_minimal.py`: Correctness + latency of three steps vs SDPA, prints gap attribution.
+- `profile_ncu.py`: Nsight Compute profiling harness — runs fwd+bwd 3 times so `ncu` picks up the kernel with repeat filter. Usage: `ncu python profile_ncu.py`.
+- `paged_kv_cache/paged_attn.py`: Paged KV Cache for LLM inference. `PagedKVCache` class manages a fixed pool of pages with page_table per request, grows on demand and frees on release. Triton `_paged_attn_fwd_kernel` walks page_table at runtime with online softmax, fp16. Includes pure Python reference for correctness.
 
 Run:
 
@@ -33,6 +36,9 @@ python v1_forward/step1_no_mask.py
 python v1_forward/step2_causal.py
 python v1_forward/step3_varlen.py
 python test_v2_minimal.py
+python v1_backward/benchmark_e2e.py
+python paged_kv_cache/paged_attn.py
+ncu python profile_ncu.py
 ```
 
 ## Accuracy
@@ -155,11 +161,46 @@ max_S |     seqlens      | Tri ms | Tri TFLOPS | Tri BW% | SDPA ms | Speedup
 
 **Windows limitation**: official flash-attn CUDA wheel won't install, so no comparison against handwritten CUDA kernels. SDPA's flash backend also doesn't run at full performance on Windows — this is likely part of why Triton can overtake so significantly at large sequences.
 
-## Not Yet Done
+## Forward+Backward End-to-End Benchmark (fp32, D_head=64)
 
-- [x] Backward (step1/step2/step3/step4/step5, complete Triton forward→backward pipeline, error vs pure Python reference < 6e-2)
-- [x] FLOPs / bandwidth recomputed from actual HBM bytes (step1 K/V loaded by S/BM programs, step2 after block skipping ≈ S²/2 rows)
-- [x] Backward benchmark + torch.profiler analysis (above)
-- [ ] Paged KV Cache (inference direction, separate project)
-- [ ] Forward+Backward end-to-end benchmark (currently backward measured independently)
-- [ ] Nsight Compute deep analysis (DRAM bandwidth, SM occupancy, L2 hit rate)
+Measures forward, backward, and fwd→bwd as a single call pair (separate fwd + bwd gives different numbers because the pair includes kernel launch overhead per call).
+
+```
+python v1_backward/benchmark_e2e.py
+```
+
+Breakdown shows what % of total training-step time goes to backward — useful for deciding whether to optimize fwd or bwd first. D_head=64 makes backward the dominant phase (vs D_head=16 where fwd+bwd are closer in FLOPs).
+
+## Nsight Compute Profiling
+
+`profile_ncu.py` runs fwd+bwd 3 times — NCU's default repeat filter drops single-run kernels but catches the 2nd/3rd invocations. Suggested metrics:
+
+```powershell
+ncu --metrics dram__bytes_read.sum, dram__bytes_write.sum, sm__throughput.avg.pct_of_peak_sustained_elapsed,gpu__compute_memory_throughput.avg.pct_of_peak_sustained_elapsed python profile_ncu.py
+```
+
+Key questions to answer:
+
+1. Is the kernel actually memory-bound (dram throughput near peak) or compute-bound (SM throughput low)?
+2. After partial+reduce, what is the bottleneck — bwd kernel or the reduce kernels?
+3. L2 hit rate on K/V loads — block skipping cuts K/V bytes roughly in half for causal, but does it actually show up in L2?
+
+Run on a Linux machine (NCU on Windows has reduced metric coverage) for full visibility.
+
+## Paged KV Cache
+
+Inference direction. `PagedKVCache` owns a fixed `[num_pages, H, PAGE_SIZE, D]` tensor, assigns pages on-demand via page_table per request, and reclaims freed pages. The Triton kernel (`_paged_attn_fwd_kernel`) receives page_table + seq_lens tensors and walks KV in arbitrary physical order — the kernel never sees a contiguous full-sequence tensor.
+
+Each program handles one (req, head) pair and processes PAGE_SIZE entries per page, loading K/V with masking at each page boundary. No causal mask needed — in generation mode Q has length 1. Scaling, online softmax, and accumulation are identical to step3 varlen.
+
+Usage pattern:
+
+```python
+cache = PagedKVCache(num_pages=128, num_heads=H, page_size=16, head_dim=D)
+cache.allocate_request(req_id=0)
+for step in range(n_tokens):
+    cache.append(req_id, K_new_step, V_new_step)
+    O = paged_attention(cache, Q_new)
+```
+
+Correctness: pure Python reference in `paged_attn_reference` (same page_table walking + softmax) cross-checked against Triton for err < 1e-2 on seq_len 256/4096, PAGE_SIZE 16/32.
