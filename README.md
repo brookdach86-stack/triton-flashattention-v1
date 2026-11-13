@@ -104,7 +104,7 @@ step1/step2：`B=2, H=8, D_head=16`，step3：padded varlen vs 纯Python referen
 | step2 (causal) | S=128/256/512 | < 4.6e-2 | < 3.7e-2 | < 1.6e-2 |
 | step3 (varlen) | [128,256] [64,128,192] | < 2.9e-2 | < 2.5e-2 | < 5.1e-3 |
 
-Backward误差比forward稍大（max ~4.6e-2），因为`dK/dV`用`tl.atomic_add`跨Q块累加——不同block的累加顺序引入额外浮点误差，但fp32下可控。step4/step5没有atomic_add，全串行累加，误差更稳。step4/varlen：`[128,256] [64,128,192]`的dQ/dK/dV全< 6.2e-2。
+Backward误差比forward稍大（max ～4.6e-2），因为`dK/dV`用`tl.atomic_add`跨Q块累加——不同block的累加顺序引入额外浮点误差，但fp32下可控。step4/step5没有atomic_add，全串行累加，误差更稳。step4/varlen：`[128,256] [64,128,192]`的dQ/dK/dV全< 6.2e-2。
 
 ## Backward性能（step4_varlen_causal，fp32，D_head=64）
 
