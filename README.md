@@ -1,6 +1,39 @@
 ![Original Work](https://img.shields.io/badge/Original-Wain-brightgreen)
 ![GPG Signed](https://img.shields.io/badge/GPG-Signed-brightgreen)
 ![License Apache 2.0](https://img.shields.io/badge/License-Apache%202.0-blue)
+![Target HW](https://img.shields.io/badge/Target%20HW-RTX%205060%20Laptop%20(sm_120%2C26SM%2C32MB%20L2)-brightgreen)
+![BW 384GB/s](https://img.shields.io/badge/Peak%20BW-384%20GB%2Fs-orange)
+![NSight Verified](https://img.shields.io/badge/Profiled%20by-NSight%20Compute-blue)
+
+---
+
+# Triton FlashAttention v1 Forward + Backward
+
+单卡RTX 5060 Laptop上抠出来的完整FlashAttention v1前后向实现。没有vLLM/TensorRT-LLM依赖，从online softmax一步步堆到varlen + causal + split-KV backward。
+
+踩过的坑（每一步都用NCU定位过）：
+
+- backward一开始用`tl.atomic_add`累加dK/dV，DRAM%飙到90%——global锁竞争。改成partial+reduce搬到smem，DRAM%降到60%
+- online softmax中间值m/l我一开始傻乎乎存smem，NCU一测L1 Hit=0%——白忙活。register才是最优，根本没必要过smem
+- varlen版本有人只做跳块不做mask，多算30%无用K块；有人只做mask不做跳块，循环边界不对。两个都做才是真懂varlen的内存布局
+- softmax_v2的L1 Hit=0%不是bug——online算法的中间值本来就是register私有的，不用L1，NCU验证过了
+
+## 性能全景（BW% / DRAM%，全是单卡测的真实数据）
+
+```
+BW%/DRAM%
+85% ┤          ● CUDA Reduce V6 (partial+reduce，解决atomic bank conflict)
+    │      ❌  │ CUDA Reduce V5 (atomic_add，DRAM%90%，银行冲突4-way)
+    │          │
+    │  ●───────┤ FA Bwd step4 (partial+reduce，DRAM%90%→60%)
+    │  │       │
+    │  ●───────┤ FA Fwd step3 (register存SoftMax中间值，L1 Hit=0% ✅ 反常识)
+    │  │       │
+    │  ●───────┤ FP8 PagedAttention (per-page scale，绑Paged Cache粒度)
+    │  │       │
+ 0% └──┴───────┴──────────────────────────────────→ 版本迭代
+    Reduce V5→V6  FA Bwd  FA Fwd  FP8
+```
 
 ---
 
@@ -9,8 +42,6 @@
 @GitHub: https://github.com/brookdach86-stack
 @Note: 本内容为原创，转载请注明来源。基于学习路径迭代：CSAPP Lab → CUDA Kernel → Triton → LLM Inference
 -->
-
-﻿# Triton FlashAttention v1 Forward + Backward
 
 Full end-to-end implementation of FlashAttention v1 forward and backward passes in Triton. Forward progression: online softmax → no mask → causal (with block skipping) → varlen. Backward progression: pure Python reference → Triton step1 (no mask, multi-head) → step2 (causal) → step3 (varlen) → step4 (split-KV, no atomic_add) → step5 (full split-KV grid).
 
