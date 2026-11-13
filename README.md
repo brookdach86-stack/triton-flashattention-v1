@@ -9,29 +9,29 @@
 
 # Triton FlashAttention v1 Forward + Backward
 
-单卡RTX 5060 Laptop上抠出来的完整FlashAttention v1前后向实现。没有vLLM/TensorRT-LLM依赖，从online softmax一步步堆到varlen + causal + split-KV backward。
+Complete FlashAttention v1 fwd+bwd from scratch on a single RTX 5060 Laptop. No vLLM/TensorRT-LLM dependency — built bottom-up from online softmax to varlen + causal + split-KV backward.
 
-踩过的坑（每一步都用NCU定位过）：
+**Pitfalls I actually hit (NCU-verified at each step)**:
 
-- backward一开始用`tl.atomic_add`累加dK/dV，DRAM%飙到90%——global锁竞争。改成partial+reduce搬到smem，DRAM%降到60%
-- online softmax中间值m/l我一开始傻乎乎存smem，NCU一测L1 Hit=0%——白忙活。register才是最优，根本没必要过smem
-- varlen版本有人只做跳块不做mask，多算30%无用K块；有人只做mask不做跳块，循环边界不对。两个都做才是真懂varlen的内存布局
-- softmax_v2的L1 Hit=0%不是bug——online算法的中间值本来就是register私有的，不用L1，NCU验证过了
+- Started with `tl.atomic_add` for dK/dV accumulation in backward — DRAM% hit 90% from global lock contention. Switched to partial+reduce in smem, DRAM% dropped to 60%
+- Initially stored online softmax intermediates (m/l) in smem like a tutorial told me — NCU showed L1 Hit=0%, total waste. Register storage is optimal, no L1 traffic needed at all
+- Varlen: some impls do block skip but forget boundary mask (30% wasted K blocks); others do mask but wrong loop bound (memory safety hole). Both required to get varlen memory layout right
+- softmax_v2 L1 Hit=0% is **not a bug** — online algorithm intermediates are register-private per row, NCU confirms zero cache traffic is correct
 
-## 性能全景（BW% / DRAM%，全是单卡测的真实数据）
+## Performance Panorama (BW% / DRAM%, all single-card real measurements)
 
 ```
 BW%/DRAM%
-85% ┤          ● CUDA Reduce V6 (partial+reduce，解决atomic bank conflict)
-    │      ❌  │ CUDA Reduce V5 (atomic_add，DRAM%90%，银行冲突4-way)
+85% ┤          ● CUDA Reduce V6 (partial+reduce, fixed atomic bank conflict)
+    │      ❌  │ CUDA Reduce V5 (atomic_add, DRAM%90%, 4-way bank conflict)
     │          │
-    │  ●───────┤ FA Bwd step4 (partial+reduce，DRAM%90%→60%)
+    │  ●───────┤ FA Bwd step4 (partial+reduce, DRAM%90%→60%)
     │  │       │
-    │  ●───────┤ FA Fwd step3 (register存SoftMax中间值，L1 Hit=0% ✅ 反常识)
+    │  ●───────┤ FA Fwd step3 (register softmax intermediates, L1 Hit=0% ✅)
     │  │       │
-    │  ●───────┤ FP8 PagedAttention (per-page scale，绑Paged Cache粒度)
+    │  ●───────┤ FP8 PagedAttention (per-page scale, bound to Paged Cache)
     │  │       │
- 0% └──┴───────┴──────────────────────────────────→ 版本迭代
+ 0% └──┴───────┴──────────────────────────────────→ version evolution
     Reduce V5→V6  FA Bwd  FA Fwd  FP8
 ```
 
