@@ -192,13 +192,13 @@ max_S |     seqlens      | Tri ms | Tri TFLOPS | Tri BW% | SDPA ms | Speedup
 
 ## 观察
 
-**Peak BW%只有40.6%——Triton没榨满带宽**。之前用理论算术强度`AI=2×D_head`算出来BW%超100%；改成实际HBM字节后就合理了。step2加block skipping后K/V字节减半，BW%进一步降到14~34%——算子从带宽受限转成了算力受限。大序列（S≥2048）Triton BW%稳定在34~41%，内存侧还有约2.5×空间。
+**Peak BW%只有40.6%——Triton没榨满带宽**。之前用理论算术强度`AI=2×D_head`算出来BW%超100%；改成实际HBM字节后就合理了。step2加block skipping后K/V字节减半，BW%进一步降到14～34%——算子从带宽受限转成了算力受限。大序列（S≥2048）Triton BW%稳定在34～41%，内存侧还有约2.5×空间。
 
 **小序列gap来自SDPA backend效率**。step1 S=512反而更慢（0.52x），但step2同size就反超了（1.20x）——block skipping把K/V load量减半，总HBM从2.4 MB降到1.4 MB，SDPA的固定overhead在小size时占主导。
 
 **Autotune不总是选64×64**。step2 S=2048选了BM=128, BN=128, ns=3, nw=8。Block skipping后loop迭代次数（KV block数）降了，更大的tile减少launch overhead。但S=4096又回到BM=64——即使减半了，K/V load绝对量还是大，小tile更好。
 
-**Varlen的优势**：padded SDPA把所有序列pad到max_seqlen，在padding token上白算。Varlen直接跳过——这就是SDPA慢2.5~3.3x的原因。FLOPs按实际有效token算，不是padded长度。
+**Varlen的优势**：padded SDPA把所有序列pad到max_seqlen，在padding token上白算。Varlen直接跳过——这就是SDPA慢2.5～3.3x的原因。FLOPs按实际有效token算，不是padded长度。
 
 **Windows限制**：官方flash-attn CUDA wheel装不了，没法和手写CUDA kernel对比。SDPA的flash backend在Windows上也跑不满性能——这可能也是Triton能在大序列上大幅反超的原因之一。
 
