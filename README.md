@@ -1,3 +1,15 @@
+![Original Work](https://img.shields.io/badge/Original-Wain-brightgreen)
+![GPG Signed](https://img.shields.io/badge/GPG-Signed-brightgreen)
+![License Apache 2.0](https://img.shields.io/badge/License-Apache%202.0-blue)
+
+---
+
+<!--
+@Author: Wain (brookdach86-stack@users.noreply.github.com)
+@GitHub: https://github.com/brookdach86-stack
+@Note: 本内容为原创，转载请注明来源。基于学习路径迭代：CSAPP Lab → CUDA Kernel → Triton → LLM Inference
+-->
+
 ﻿# Triton FlashAttention v1 Forward + Backward
 
 Full end-to-end implementation of FlashAttention v1 forward and backward passes in Triton. Forward progression: online softmax → no mask → causal (with block skipping) → varlen. Backward progression: pure Python reference → Triton step1 (no mask, multi-head) → step2 (causal) → step3 (varlen) → step4 (split-KV, no atomic_add) → step5 (full split-KV grid).

@@ -1,3 +1,6 @@
+# @Author: Wain (brookdach86-stack@users.noreply.github.com)
+# @GitHub: https://github.com/brookdach86-stack
+# @Note: 本代码为原创，转载请注明来源。基于学习路径迭代：CSAPP Lab → CUDA Kernel → Triton → LLM Inference
 import torch
 import triton
 import triton.language as tl
