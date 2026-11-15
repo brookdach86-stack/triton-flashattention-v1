@@ -90,24 +90,24 @@ def _paged_attn_fwd_kernel(
 
     for pi in range(0, n_pages):
         page_id = tl.load(page_table_ptr + req * stride_ptb + pi * stride_ptn)
-        if page_id < 0:
-            continue
+        valid_page = page_id >= 0
+        page_id_safe = tl.where(valid_page, page_id, 0)
         slot = tl.arange(0, PAGE_SIZE)
         pos = pi * PAGE_SIZE + slot
         valid = pos < seq_len
 
-        k_ptrs = K_ptr + page_id * stride_kp + head * stride_kh + slot[:, None] * stride_kn + d_offs[None, :] * stride_kk
-        k = tl.load(k_ptrs, mask=valid[:, None], other=0.0).to(tl.float32)
+        k_ptrs = K_ptr + page_id_safe * stride_kp + head * stride_kh + slot[:, None] * stride_kn + d_offs[None, :] * stride_kk
+        k = tl.load(k_ptrs, mask=valid[:, None] & valid_page, other=0.0).to(tl.float32)
 
         score = tl.sum(q[None, :] * k, axis=1) * scale
-        score = tl.where(valid, score, float('-inf'))
+        score = tl.where(valid & valid_page, score, float('-inf'))
 
         m_new = tl.maximum(m, tl.max(score))
         alpha = tl.exp(m - m_new)
         p = tl.exp(score - m_new)
 
-        v_ptrs = V_ptr + page_id * stride_vp + head * stride_vh + slot[:, None] * stride_vn + d_offs[None, :] * stride_vk
-        v = tl.load(v_ptrs, mask=valid[:, None], other=0.0).to(tl.float32)
+        v_ptrs = V_ptr + page_id_safe * stride_vp + head * stride_vh + slot[:, None] * stride_vn + d_offs[None, :] * stride_vk
+        v = tl.load(v_ptrs, mask=valid[:, None] & valid_page, other=0.0).to(tl.float32)
 
         l = alpha * l + tl.sum(p)
         o = alpha * o + tl.sum(p[:, None] * v, axis=0)
