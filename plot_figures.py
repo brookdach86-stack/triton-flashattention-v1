@@ -38,14 +38,17 @@ ax.plot(S, s1, marker="o", markersize=7, linewidth=2, color=C_BASE,
 ax.plot(S, s2, marker="s", markersize=7, linewidth=2, color=C_ACC,
         markerfacecolor="white", markeredgewidth=2, label="step2 causal + block-skip")
 ax.axhline(1.0, color="gray", linestyle="--", linewidth=1.2, label="parity (1x)")
-for x, y in zip(S, s1):
-    ax.annotate(f"{y:.2f}x", (x, y), textcoords="offset points",
-                xytext=(-16, 10) if y < 1 else (0, 9),
-                ha="center", fontsize=8.5, color=C_BASE)
-for x, y in zip(S, s2):
-    ax.annotate(f"{y:.2f}x", (x, y), textcoords="offset points",
-                xytext=(18, 8) if y < 2 else (0, -14),
-                ha="center", fontsize=8.5, color=C_ACC)
+
+off1 = [(-20, -6), (0, 13), (0, 13), (0, -20)]
+off2 = [(-18, 10), (0, -20), (0, -20), (0, 13)]
+for x, y, (dx, dy) in zip(S, s1, off1):
+    ax.annotate(f"{y:.2f}x", (x, y), textcoords="offset points", xytext=(dx, dy),
+                ha="right" if dx < 0 else ("left" if dx > 0 else "center"),
+                va="center", fontsize=8.5, color=C_BASE, fontweight="bold")
+for x, y, (dx, dy) in zip(S, s2, off2):
+    ax.annotate(f"{y:.2f}x", (x, y), textcoords="offset points", xytext=(dx, dy),
+                ha="right" if dx < 0 else ("left" if dx > 0 else "center"),
+                va="center", fontsize=8.5, color=C_ACC, fontweight="bold")
 ax.set_xscale("log", base=2)
 ax.set_xticks(S)
 ax.set_xticklabels([str(s) for s in S])
@@ -53,9 +56,11 @@ ax.set_xlabel("Sequence length")
 ax.set_ylabel("Speedup vs PyTorch SDPA")
 ax.set_title("FlashAttention Forward: Triton vs SDPA (fp16, B=1 H=8 D_head=16)",
              fontweight="bold")
-ax.set_ylim(0, 5.6)
+ax.set_ylim(0, 5.9)
+ax.set_xlim(400, 5000)
+ax.margins(x=0.06)
 ax.legend(fontsize=9, frameon=False, loc="upper left")
-ax.text(0.55, 0.30, "block skipping 让 K/V load 减半\n大序列稳定 3.8~4.1x", transform=ax.transAxes,
+ax.text(0.5, 0.18, "block skipping 让 K/V load 减半\n大序列稳定 3.8~4.1x", transform=ax.transAxes,
         fontsize=8.5, color=C_ACC, fontweight="bold",
         bbox=dict(boxstyle="round,pad=0.3", fc="#FFF3E0", ec=C_ACC, alpha=0.9))
 fig.tight_layout()
