@@ -9,7 +9,7 @@
 
 # Triton FlashAttention v1 Forward + Backward
 
-![architecture](figures/fig0_architecture.png)
+![architecture](https://ghfast.top/https://raw.githubusercontent.com/brookdach86-stack/triton-flashattention-v1/main/figures/fig0_architecture.png)
 
 单卡RTX 5060 Laptop上从零实现的完整FlashAttention v1前后向。不用vLLM/TensorRT-LLM——从online softmax一步步堆到varlen + causal + split-KV backward。
 
@@ -110,7 +110,7 @@ Backward误差比forward稍大（max ～4.6e-2），因为`dK/dV`用`tl.atomic_a
 
 ## Backward性能（step4_varlen_causal，fp32，D_head=64）
 
-![backward](figures/fig2_backward.png)
+![backward](https://ghfast.top/https://raw.githubusercontent.com/brookdach86-stack/triton-flashattention-v1/main/figures/fig2_backward.png)
 
 纯Python reference的加速比，RTX 5060 Laptop：
 
@@ -149,7 +149,7 @@ Total                           2.99ms
 
 ## Forward性能
 
-![forward](figures/fig1_forward_speedup.png)
+![forward](https://ghfast.top/https://raw.githubusercontent.com/brookdach86-stack/triton-flashattention-v1/main/figures/fig1_forward_speedup.png)
 
 **step1 no mask，fp16，B=1, H=8, D=128 (D_head=16)**
 
